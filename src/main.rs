@@ -108,7 +108,6 @@ async fn generate_address_for_network(
     };
     //let address = base58check_encode(&versioned_payload)?;
 
-    // 返回私钥和地址
     let private_key = encode(secret_key.secret_bytes());
     Ok((private_key, address))
 }
@@ -130,7 +129,6 @@ async fn mnemonic_to_private_key_and_address(
 
     match network {
         "BTC" => {
-            // 生产可切换配置：默认全开（标准 + hardened + BIP141 双语义）
             let bip141_semantics = {
                 let mut semantics = Vec::new();
                 if BTC_SCAN_BIP141_P2SH_P2WPKH {
@@ -167,12 +165,7 @@ async fn mnemonic_to_private_key_and_address(
                     "m/84'/0'/0'/0/{}",
                     "m/84'/0'/0'/0'/{}'",
                 ),
-                (
-                    "BIP141",
-                    bip141_semantics,
-                    "m/0/{}",
-                    "m/0'/{}'",
-                ),
+                ("BIP141", bip141_semantics, "m/0/{}", "m/0'/{}'"),
             ];
 
             for (spec_name, script_semantics_list, standard_tpl, hardened_tpl) in btc_specs {
@@ -278,7 +271,7 @@ async fn get_balance(address: &str, network: &str) -> Result<f64> {
 const CHECK_INTERVAL_SECS: u64 = 3;
 const REQUEST_TIMEOUT_SECS: u64 = 15;
 const MAX_PROVIDER_RETRIES: usize = 2;
-const BTC_ADDRESS_INDEX_END_EXCLUSIVE: usize = 10;
+const BTC_ADDRESS_INDEX_END_EXCLUSIVE: usize = 1;
 const BTC_SCAN_STANDARD_PATHS: bool = true;
 const BTC_SCAN_HARDENED_PATHS: bool = true;
 const BTC_SCAN_BIP141_P2SH_P2WPKH: bool = true;
@@ -424,6 +417,62 @@ async fn request_text_with_retries(client: &Client, provider: &str, url: &str) -
     ))
 }
 
+async fn request_json_post_with_retries(
+    client: &Client,
+    provider: &str,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let mut errors = Vec::new();
+
+    for attempt in 0..=MAX_PROVIDER_RETRIES {
+        throttle_requests().await;
+
+        let response = match client.post(url).json(body).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                errors.push(format!("attempt {} request failed: {}", attempt + 1, e));
+                if attempt < MAX_PROVIDER_RETRIES {
+                    sleep(Duration::from_millis(700 * (attempt as u64 + 1))).await;
+                    continue;
+                }
+                break;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            errors.push(format!("attempt {} returned status {}", attempt + 1, status));
+            if (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+                && attempt < MAX_PROVIDER_RETRIES
+            {
+                sleep(Duration::from_millis(1200 * (attempt as u64 + 1))).await;
+                continue;
+            }
+            break;
+        }
+
+        match response.json::<serde_json::Value>().await {
+            Ok(parsed) => return Ok(parsed),
+            Err(e) => {
+                errors.push(format!("attempt {} json parse failed: {}", attempt + 1, e));
+                if attempt < MAX_PROVIDER_RETRIES {
+                    sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "provider {} failed for {}: {}",
+        provider,
+        url,
+        errors.join(" | ")
+    ))
+}
+
 fn json_value_to_f64(value: &serde_json::Value) -> Option<f64> {
     value
         .as_f64()
@@ -460,6 +509,42 @@ fn parse_btc_balance_blockcypher(parsed: &serde_json::Value) -> Result<f64> {
     Ok(sats * 1e-8)
 }
 
+fn parse_blockchair_balance_sats(parsed: &serde_json::Value, address: &str) -> Result<f64> {
+    let sats = json_value_to_f64(&parsed["data"][address]["address"]["balance"])
+        .ok_or_else(|| anyhow!("missing blockchair data.{address}.address.balance"))?;
+    Ok(sats * 1e-8)
+}
+
+fn parse_blockchair_balance_wei(parsed: &serde_json::Value, address: &str) -> Result<f64> {
+    let wei = json_value_to_f64(&parsed["data"][address]["address"]["balance"])
+        .ok_or_else(|| anyhow!("missing blockchair data.{address}.address.balance"))?;
+    Ok(wei * 1e-18)
+}
+
+fn parse_trezor_blockbook_balance_sats(parsed: &serde_json::Value) -> Result<f64> {
+    let sats = json_value_to_f64(&parsed["balance"])
+        .ok_or_else(|| anyhow!("missing balance in trezor blockbook response"))?;
+    Ok(sats * 1e-8)
+}
+
+fn parse_cryptoid_balance_text(text: &str) -> Result<f64> {
+    let cleaned = text.trim();
+    let balance = cleaned
+        .parse::<f64>()
+        .map_err(|e| anyhow!("invalid cryptoid response '{}': {}", cleaned, e))?;
+    Ok(balance)
+}
+
+fn parse_eth_rpc_hex_balance(parsed: &serde_json::Value) -> Result<f64> {
+    let hex = parsed["result"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing result in rpc response"))?;
+    let hex = hex.strip_prefix("0x").unwrap_or(hex);
+    let wei = u128::from_str_radix(hex, 16)
+        .map_err(|e| anyhow!("invalid hex balance '{}': {}", hex, e))?;
+    Ok((wei as f64) * 1e-18)
+}
+
 async fn get_btc_balance_with_failover(client: &Client, address: &str) -> Result<f64> {
     let sources = vec![
         (
@@ -487,37 +572,73 @@ async fn get_btc_balance_with_failover(client: &Client, address: &str) -> Result
                 address
             ),
         ),
+        (
+            "mempool_space",
+            format!("https://mempool.space/api/address/{}", address),
+        ),
+        (
+            "blockchair",
+            format!("https://api.blockchair.com/bitcoin/dashboards/address/{}", address),
+        ),
+        (
+            "cryptoid",
+            format!(
+                "https://chainz.cryptoid.info/btc/api.dws?q=getbalance&a={}",
+                address
+            ),
+        ),
+        (
+            "trezor_blockbook",
+            format!("https://btc1.trezor.io/api/v2/address/{}", address),
+        ),
     ];
 
     let mut errors = Vec::new();
 
     for (source_name, url) in sources {
-        let parsed = match request_json_with_retries(client, source_name, &url).await {
-            Ok(v) => v,
-            Err(e) => {
-                errors.push(e.to_string());
-                continue;
-            }
-        };
-
         let balance_result = match source_name {
-            "haskoin" => parse_btc_balance_haskoin(&parsed),
-            "blockstream" => parse_btc_balance_blockstream(&parsed),
-            "blockcypher" => parse_btc_balance_blockcypher(&parsed),
-            "sochain" => {
-                let confirmed = json_value_to_f64(&parsed["data"]["confirmed_balance"])
-                    .ok_or_else(|| anyhow!("missing data.confirmed_balance in sochain response"))?;
-                let unconfirmed =
-                    json_value_to_f64(&parsed["data"]["unconfirmed_balance"]).unwrap_or(0.0);
-                Ok(confirmed + unconfirmed)
+            "cryptoid" => {
+                let text = match request_text_with_retries(client, source_name, &url).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!("{} failed: {}", source_name, e));
+                        continue;
+                    }
+                };
+                parse_cryptoid_balance_text(&text)
             }
-            _ => Err(anyhow!("unknown BTC source: {}", source_name)),
+            _ => {
+                let parsed = match request_json_with_retries(client, source_name, &url).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!("{} failed: {}", source_name, e));
+                        continue;
+                    }
+                };
+                match source_name {
+                    "haskoin" => parse_btc_balance_haskoin(&parsed),
+                    "blockstream" | "mempool_space" => parse_btc_balance_blockstream(&parsed),
+                    "blockcypher" => parse_btc_balance_blockcypher(&parsed),
+                    "sochain" => {
+                        let confirmed = json_value_to_f64(&parsed["data"]["confirmed_balance"])
+                            .ok_or_else(|| {
+                                anyhow!("missing data.confirmed_balance in sochain response")
+                            })?;
+                        let unconfirmed = json_value_to_f64(&parsed["data"]["unconfirmed_balance"])
+                            .unwrap_or(0.0);
+                        Ok(confirmed + unconfirmed)
+                    }
+                    "blockchair" => parse_blockchair_balance_sats(&parsed, address),
+                    "trezor_blockbook" => parse_trezor_blockbook_balance_sats(&parsed),
+                    _ => Err(anyhow!("unknown BTC source: {}", source_name)),
+                }
+            }
         };
 
         match balance_result {
             Ok(balance) => return Ok(balance),
             Err(e) => {
-                errors.push(format!("{} schema parse failed: {}", source_name, e));
+                errors.push(format!("{} failed: {}", source_name, e));
             }
         }
     }
@@ -545,38 +666,96 @@ async fn get_eth_balance_with_failover(client: &Client, address: &str) -> Result
                 address
             ),
         ),
+        (
+            "blockchair",
+            format!(
+                "https://api.blockchair.com/ethereum/dashboards/address/{}",
+                address
+            ),
+        ),
+        (
+            "ethplorer",
+            format!(
+                "https://api.ethplorer.io/getAddressInfo/{}?apiKey=freekey",
+                address
+            ),
+        ),
+        (
+            "blockscout",
+            format!(
+                "https://eth.blockscout.com/api?module=account&action=balance&address={}",
+                address
+            ),
+        ),
+        ("cloudflare_rpc", "https://cloudflare-eth.com".to_string()),
+        ("ankr_rpc", "https://rpc.ankr.com/eth".to_string()),
+        ("flashbots_rpc", "https://rpc.flashbots.net".to_string()),
     ];
 
     let mut errors = Vec::new();
     for (source_name, url) in sources {
-        let parsed = match request_json_with_retries(client, source_name, &url).await {
-            Ok(v) => v,
-            Err(e) => {
-                errors.push(e.to_string());
-                continue;
-            }
-        };
-
         let balance_result = match source_name {
-            "blockchain_info" => {
-                let wei = json_value_to_f64(&parsed["balance"])
-                    .ok_or_else(|| anyhow!("missing balance in blockchain_info ETH response"))?;
-                Ok(wei * 1e-18)
+            "cloudflare_rpc" | "ankr_rpc" | "flashbots_rpc" => {
+                let rpc_body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "eth_getBalance",
+                    "params": [address, "latest"],
+                    "id": 1
+                });
+                let parsed =
+                    match request_json_post_with_retries(client, source_name, &url, &rpc_body)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            errors.push(format!("{} failed: {}", source_name, e));
+                            continue;
+                        }
+                    };
+                parse_eth_rpc_hex_balance(&parsed)
             }
-            "blockcypher" => {
-                let wei = json_value_to_f64(&parsed["final_balance"])
-                    .or_else(|| json_value_to_f64(&parsed["balance"]))
-                    .ok_or_else(|| {
-                        anyhow!("missing final_balance/balance in blockcypher ETH response")
-                    })?;
-                Ok(wei * 1e-18)
+            _ => {
+                let parsed = match request_json_with_retries(client, source_name, &url).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!("{} failed: {}", source_name, e));
+                        continue;
+                    }
+                };
+                match source_name {
+                    "blockchain_info" => {
+                        let wei = json_value_to_f64(&parsed["balance"]).ok_or_else(|| {
+                            anyhow!("missing balance in blockchain_info ETH response")
+                        })?;
+                        Ok(wei * 1e-18)
+                    }
+                    "blockcypher" => {
+                        let wei = json_value_to_f64(&parsed["final_balance"])
+                            .or_else(|| json_value_to_f64(&parsed["balance"]))
+                            .ok_or_else(|| {
+                                anyhow!("missing final_balance/balance in blockcypher ETH response")
+                            })?;
+                        Ok(wei * 1e-18)
+                    }
+                    "blockchair" => parse_blockchair_balance_wei(&parsed, address),
+                    "ethplorer" => {
+                        let balance = json_value_to_f64(&parsed["ETH"]["balance"])
+                            .ok_or_else(|| anyhow!("missing ETH.balance in ethplorer response"))?;
+                        Ok(balance)
+                    }
+                    "blockscout" => {
+                        let wei = json_value_to_f64(&parsed["result"])
+                            .ok_or_else(|| anyhow!("missing result in blockscout response"))?;
+                        Ok(wei * 1e-18)
+                    }
+                    _ => Err(anyhow!("unknown ETH source: {}", source_name)),
+                }
             }
-            _ => Err(anyhow!("unknown ETH source: {}", source_name)),
         };
 
         match balance_result {
             Ok(balance) => return Ok(balance),
-            Err(e) => errors.push(format!("{} schema parse failed: {}", source_name, e)),
+            Err(e) => errors.push(format!("{} failed: {}", source_name, e)),
         }
     }
 
@@ -620,32 +799,67 @@ async fn get_doge_balance_with_failover(client: &Client, address: &str) -> Resul
                 address
             ),
         ),
+        (
+            "chain_so",
+            format!("https://chain.so/api/v2/get_address_balance/DOGE/{}", address),
+        ),
+        (
+            "blockchair",
+            format!("https://api.blockchair.com/dogecoin/dashboards/address/{}", address),
+        ),
+        (
+            "cryptoid",
+            format!(
+                "https://chainz.cryptoid.info/doge/api.dws?q=getbalance&a={}",
+                address
+            ),
+        ),
+        (
+            "trezor_blockbook",
+            format!("https://doge1.trezor.io/api/v2/address/{}", address),
+        ),
     ];
 
     let mut errors = Vec::new();
     for (source_name, url) in sources {
-        let parsed = match request_json_with_retries(client, source_name, &url).await {
-            Ok(v) => v,
-            Err(e) => {
-                errors.push(e.to_string());
-                continue;
-            }
-        };
-
         let balance_result = match source_name {
-            "coinspace" => parse_coinspace_array_balance(&parsed),
-            "blockcypher" => {
-                let sats = json_value_to_f64(&parsed["final_balance"])
-                    .ok_or_else(|| anyhow!("missing final_balance in blockcypher DOGE response"))?;
-                Ok(sats * 1e-8)
+            "cryptoid" => {
+                let text = match request_text_with_retries(client, source_name, &url).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!("{} failed: {}", source_name, e));
+                        continue;
+                    }
+                };
+                parse_cryptoid_balance_text(&text)
             }
-            "sochain" => parse_sochain_coin_balance(&parsed),
-            _ => Err(anyhow!("unknown DOGE source: {}", source_name)),
+            _ => {
+                let parsed = match request_json_with_retries(client, source_name, &url).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!("{} failed: {}", source_name, e));
+                        continue;
+                    }
+                };
+                match source_name {
+                    "coinspace" => parse_coinspace_array_balance(&parsed),
+                    "blockcypher" => {
+                        let sats = json_value_to_f64(&parsed["final_balance"]).ok_or_else(|| {
+                            anyhow!("missing final_balance in blockcypher DOGE response")
+                        })?;
+                        Ok(sats * 1e-8)
+                    }
+                    "sochain" | "chain_so" => parse_sochain_coin_balance(&parsed),
+                    "blockchair" => parse_blockchair_balance_sats(&parsed, address),
+                    "trezor_blockbook" => parse_trezor_blockbook_balance_sats(&parsed),
+                    _ => Err(anyhow!("unknown DOGE source: {}", source_name)),
+                }
+            }
         };
 
         match balance_result {
             Ok(balance) => return Ok(balance),
-            Err(e) => errors.push(format!("{} schema parse failed: {}", source_name, e)),
+            Err(e) => errors.push(format!("{} failed: {}", source_name, e)),
         }
     }
 
@@ -676,32 +890,67 @@ async fn get_dash_balance_with_failover(client: &Client, address: &str) -> Resul
                 address
             ),
         ),
+        (
+            "chain_so",
+            format!("https://chain.so/api/v2/get_address_balance/DASH/{}", address),
+        ),
+        (
+            "blockchair",
+            format!("https://api.blockchair.com/dash/dashboards/address/{}", address),
+        ),
+        (
+            "cryptoid",
+            format!(
+                "https://chainz.cryptoid.info/dash/api.dws?q=getbalance&a={}",
+                address
+            ),
+        ),
+        (
+            "trezor_blockbook",
+            format!("https://dash1.trezor.io/api/v2/address/{}", address),
+        ),
     ];
 
     let mut errors = Vec::new();
     for (source_name, url) in sources {
-        let parsed = match request_json_with_retries(client, source_name, &url).await {
-            Ok(v) => v,
-            Err(e) => {
-                errors.push(e.to_string());
-                continue;
-            }
-        };
-
         let balance_result = match source_name {
-            "coinspace" => parse_coinspace_array_balance(&parsed),
-            "blockcypher" => {
-                let sats = json_value_to_f64(&parsed["final_balance"])
-                    .ok_or_else(|| anyhow!("missing final_balance in blockcypher DASH response"))?;
-                Ok(sats * 1e-8)
+            "cryptoid" => {
+                let text = match request_text_with_retries(client, source_name, &url).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!("{} failed: {}", source_name, e));
+                        continue;
+                    }
+                };
+                parse_cryptoid_balance_text(&text)
             }
-            "sochain" => parse_sochain_coin_balance(&parsed),
-            _ => Err(anyhow!("unknown DASH source: {}", source_name)),
+            _ => {
+                let parsed = match request_json_with_retries(client, source_name, &url).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!("{} failed: {}", source_name, e));
+                        continue;
+                    }
+                };
+                match source_name {
+                    "coinspace" => parse_coinspace_array_balance(&parsed),
+                    "blockcypher" => {
+                        let sats = json_value_to_f64(&parsed["final_balance"]).ok_or_else(|| {
+                            anyhow!("missing final_balance in blockcypher DASH response")
+                        })?;
+                        Ok(sats * 1e-8)
+                    }
+                    "sochain" | "chain_so" => parse_sochain_coin_balance(&parsed),
+                    "blockchair" => parse_blockchair_balance_sats(&parsed, address),
+                    "trezor_blockbook" => parse_trezor_blockbook_balance_sats(&parsed),
+                    _ => Err(anyhow!("unknown DASH source: {}", source_name)),
+                }
+            }
         };
 
         match balance_result {
             Ok(balance) => return Ok(balance),
-            Err(e) => errors.push(format!("{} schema parse failed: {}", source_name, e)),
+            Err(e) => errors.push(format!("{} failed: {}", source_name, e)),
         }
     }
 
@@ -732,32 +981,67 @@ async fn get_ltc_balance_with_failover(client: &Client, address: &str) -> Result
                 address
             ),
         ),
+        (
+            "chain_so",
+            format!("https://chain.so/api/v2/get_address_balance/LTC/{}", address),
+        ),
+        (
+            "blockchair",
+            format!("https://api.blockchair.com/litecoin/dashboards/address/{}", address),
+        ),
+        (
+            "cryptoid",
+            format!(
+                "https://chainz.cryptoid.info/ltc/api.dws?q=getbalance&a={}",
+                address
+            ),
+        ),
+        (
+            "trezor_blockbook",
+            format!("https://ltc1.trezor.io/api/v2/address/{}", address),
+        ),
     ];
 
     let mut errors = Vec::new();
     for (source_name, url) in sources {
-        let parsed = match request_json_with_retries(client, source_name, &url).await {
-            Ok(v) => v,
-            Err(e) => {
-                errors.push(e.to_string());
-                continue;
-            }
-        };
-
         let balance_result = match source_name {
-            "coinspace" => parse_coinspace_array_balance(&parsed),
-            "blockcypher" => {
-                let sats = json_value_to_f64(&parsed["final_balance"])
-                    .ok_or_else(|| anyhow!("missing final_balance in blockcypher LTC response"))?;
-                Ok(sats * 1e-8)
+            "cryptoid" => {
+                let text = match request_text_with_retries(client, source_name, &url).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!("{} failed: {}", source_name, e));
+                        continue;
+                    }
+                };
+                parse_cryptoid_balance_text(&text)
             }
-            "sochain" => parse_sochain_coin_balance(&parsed),
-            _ => Err(anyhow!("unknown LTC source: {}", source_name)),
+            _ => {
+                let parsed = match request_json_with_retries(client, source_name, &url).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!("{} failed: {}", source_name, e));
+                        continue;
+                    }
+                };
+                match source_name {
+                    "coinspace" => parse_coinspace_array_balance(&parsed),
+                    "blockcypher" => {
+                        let sats = json_value_to_f64(&parsed["final_balance"]).ok_or_else(|| {
+                            anyhow!("missing final_balance in blockcypher LTC response")
+                        })?;
+                        Ok(sats * 1e-8)
+                    }
+                    "sochain" | "chain_so" => parse_sochain_coin_balance(&parsed),
+                    "blockchair" => parse_blockchair_balance_sats(&parsed, address),
+                    "trezor_blockbook" => parse_trezor_blockbook_balance_sats(&parsed),
+                    _ => Err(anyhow!("unknown LTC source: {}", source_name)),
+                }
+            }
         };
 
         match balance_result {
             Ok(balance) => return Ok(balance),
-            Err(e) => errors.push(format!("{} schema parse failed: {}", source_name, e)),
+            Err(e) => errors.push(format!("{} failed: {}", source_name, e)),
         }
     }
 
@@ -1003,10 +1287,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 开始生成和检查密钥
     let start_time = Instant::now();
 
-    // 开始生成并检查钱包
     generate_and_check_keys(
         file_path,
         Language::English,
@@ -1018,8 +1300,8 @@ async fn main() -> Result<()> {
             "DASH".to_string(),
             "LTC".to_string(),
             "RVN".to_string(),
-        ], // 支持的网络
-        vec![12, 18, 24], // 支持的助记词长度
+        ],
+        vec![12, 18, 24],
     )
     .await?;
 

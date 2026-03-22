@@ -1,26 +1,9 @@
 use anyhow::anyhow;
 use bitcoin::hashes::{sha256, Hash};
-use regex::Regex;
 use sha2::{Digest, Sha256};
 
 const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const RIPPLE_B58_DIGITS: &[u8] = b"rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz";
-
-pub fn extract_doge_balance(html: &str) -> Option<f64> {
-    // 正则表达式匹配 "Balance" 行之后的 DOGE 余额
-    let re = Regex::new(r#"<td>Balance</td>\s*<td><span class="currency">([0-9]+\.[0-9]+)</span> DOGE</td>"#).unwrap();
-
-    // 查找匹配项
-    if let Some(caps) = re.captures(html) {
-        // 提取余额字符串
-        let balance_str = &caps[1];
-        // 尝试将字符串转换为 f64
-        balance_str.parse::<f64>().ok()
-    } else {
-        None
-    }
-}
-
 
 pub fn remove_prefix(public_key: &[u8]) -> [u8; 64] {
     let mut public_key_no_prefix = [0u8; 64]; // 创建一个长度为 64 的数组
