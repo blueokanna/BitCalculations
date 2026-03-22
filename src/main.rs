@@ -14,6 +14,7 @@ use futures::future::join_all;
 use hex::encode;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tiny_keccak::{Hasher, Keccak};
@@ -276,11 +277,69 @@ const BTC_SCAN_STANDARD_PATHS: bool = true;
 const BTC_SCAN_HARDENED_PATHS: bool = true;
 const BTC_SCAN_BIP141_P2SH_P2WPKH: bool = true;
 const BTC_SCAN_BIP141_P2WPKH: bool = true;
+const VERBOSE_BALANCE_ERRORS: bool = false;
+const PROVIDER_COOLDOWN_429_SECS: u64 = 300;
+const PROVIDER_COOLDOWN_FORBIDDEN_SECS: u64 = 3600;
+const PROVIDER_COOLDOWN_NOT_FOUND_SECS: u64 = 3600;
+const PROVIDER_COOLDOWN_430_SECS: u64 = 1800;
 
 static RATE_LIMITER: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+static PROVIDER_COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 fn global_rate_limiter() -> &'static Mutex<Option<Instant>> {
     RATE_LIMITER.get_or_init(|| Mutex::new(None))
+}
+
+fn provider_cooldown_map() -> &'static Mutex<HashMap<String, Instant>> {
+    PROVIDER_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn is_provider_in_cooldown(provider: &str) -> bool {
+    let mut guard = provider_cooldown_map().lock().await;
+    if let Some(until) = guard.get(provider).copied() {
+        if Instant::now() < until {
+            return true;
+        }
+        guard.remove(provider);
+    }
+    false
+}
+
+async fn set_provider_cooldown(provider: &str, duration: Duration) {
+    let mut guard = provider_cooldown_map().lock().await;
+    guard.insert(provider.to_string(), Instant::now() + duration);
+}
+
+fn status_retry_policy(status: StatusCode) -> (bool, Option<Duration>) {
+    let code = status.as_u16();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return (
+            false,
+            Some(Duration::from_secs(PROVIDER_COOLDOWN_429_SECS)),
+        );
+    }
+    if status == StatusCode::FORBIDDEN {
+        return (
+            false,
+            Some(Duration::from_secs(PROVIDER_COOLDOWN_FORBIDDEN_SECS)),
+        );
+    }
+    if status == StatusCode::NOT_FOUND {
+        return (
+            false,
+            Some(Duration::from_secs(PROVIDER_COOLDOWN_NOT_FOUND_SECS)),
+        );
+    }
+    if code == 430 {
+        return (
+            false,
+            Some(Duration::from_secs(PROVIDER_COOLDOWN_430_SECS)),
+        );
+    }
+    if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT {
+        return (true, None);
+    }
+    (false, None)
 }
 
 async fn throttle_requests() {
@@ -308,6 +367,10 @@ async fn request_json_with_retries(
     provider: &str,
     url: &str,
 ) -> Result<serde_json::Value> {
+    if is_provider_in_cooldown(provider).await {
+        return Err(anyhow!("provider {} temporarily in cooldown", provider));
+    }
+
     let mut errors = Vec::new();
 
     for attempt in 0..=MAX_PROVIDER_RETRIES {
@@ -332,9 +395,11 @@ async fn request_json_with_retries(
                 attempt + 1,
                 status
             ));
-            if (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
-                && attempt < MAX_PROVIDER_RETRIES
-            {
+            let (retryable, cooldown) = status_retry_policy(status);
+            if let Some(duration) = cooldown {
+                set_provider_cooldown(provider, duration).await;
+            }
+            if retryable && attempt < MAX_PROVIDER_RETRIES {
                 sleep(Duration::from_millis(1200 * (attempt as u64 + 1))).await;
                 continue;
             }
@@ -363,6 +428,10 @@ async fn request_json_with_retries(
 }
 
 async fn request_text_with_retries(client: &Client, provider: &str, url: &str) -> Result<String> {
+    if is_provider_in_cooldown(provider).await {
+        return Err(anyhow!("provider {} temporarily in cooldown", provider));
+    }
+
     let mut errors = Vec::new();
 
     for attempt in 0..=MAX_PROVIDER_RETRIES {
@@ -387,9 +456,11 @@ async fn request_text_with_retries(client: &Client, provider: &str, url: &str) -
                 attempt + 1,
                 status
             ));
-            if (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
-                && attempt < MAX_PROVIDER_RETRIES
-            {
+            let (retryable, cooldown) = status_retry_policy(status);
+            if let Some(duration) = cooldown {
+                set_provider_cooldown(provider, duration).await;
+            }
+            if retryable && attempt < MAX_PROVIDER_RETRIES {
                 sleep(Duration::from_millis(1200 * (attempt as u64 + 1))).await;
                 continue;
             }
@@ -423,6 +494,10 @@ async fn request_json_post_with_retries(
     url: &str,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value> {
+    if is_provider_in_cooldown(provider).await {
+        return Err(anyhow!("provider {} temporarily in cooldown", provider));
+    }
+
     let mut errors = Vec::new();
 
     for attempt in 0..=MAX_PROVIDER_RETRIES {
@@ -443,9 +518,11 @@ async fn request_json_post_with_retries(
         if !response.status().is_success() {
             let status = response.status();
             errors.push(format!("attempt {} returned status {}", attempt + 1, status));
-            if (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
-                && attempt < MAX_PROVIDER_RETRIES
-            {
+            let (retryable, cooldown) = status_retry_policy(status);
+            if let Some(duration) = cooldown {
+                set_provider_cooldown(provider, duration).await;
+            }
+            if retryable && attempt < MAX_PROVIDER_RETRIES {
                 sleep(Duration::from_millis(1200 * (attempt as u64 + 1))).await;
                 continue;
             }
@@ -818,6 +895,10 @@ async fn get_doge_balance_with_failover(client: &Client, address: &str) -> Resul
             "trezor_blockbook",
             format!("https://doge1.trezor.io/api/v2/address/{}", address),
         ),
+        (
+            "dogecoinspace",
+            format!("https://dogecoinspace.org/api/address/{}", address),
+        ),
     ];
 
     let mut errors = Vec::new();
@@ -852,6 +933,7 @@ async fn get_doge_balance_with_failover(client: &Client, address: &str) -> Resul
                     "sochain" | "chain_so" => parse_sochain_coin_balance(&parsed),
                     "blockchair" => parse_blockchair_balance_sats(&parsed, address),
                     "trezor_blockbook" => parse_trezor_blockbook_balance_sats(&parsed),
+                    "dogecoinspace" => parse_btc_balance_blockstream(&parsed),
                     _ => Err(anyhow!("unknown DOGE source: {}", source_name)),
                 }
             }
@@ -1000,6 +1082,10 @@ async fn get_ltc_balance_with_failover(client: &Client, address: &str) -> Result
             "trezor_blockbook",
             format!("https://ltc1.trezor.io/api/v2/address/{}", address),
         ),
+        (
+            "litecoinspace",
+            format!("https://litecoinspace.org/api/address/{}", address),
+        ),
     ];
 
     let mut errors = Vec::new();
@@ -1034,6 +1120,7 @@ async fn get_ltc_balance_with_failover(client: &Client, address: &str) -> Result
                     "sochain" | "chain_so" => parse_sochain_coin_balance(&parsed),
                     "blockchair" => parse_blockchair_balance_sats(&parsed, address),
                     "trezor_blockbook" => parse_trezor_blockbook_balance_sats(&parsed),
+                    "litecoinspace" => parse_btc_balance_blockstream(&parsed),
                     _ => Err(anyhow!("unknown LTC source: {}", source_name)),
                 }
             }
@@ -1223,10 +1310,17 @@ async fn generate_and_check_keys(
                                                 {
                                                     Ok(value) => value,
                                                     Err(e) => {
-                                                        println!(
-                                                            "{} Address: {} -> balance query failed: {}",
-                                                            network_str, address, e
-                                                        );
+                                                        if VERBOSE_BALANCE_ERRORS {
+                                                            println!(
+                                                                "{} Address: {} -> balance query failed: {}",
+                                                                network_str, address, e
+                                                            );
+                                                        } else {
+                                                            println!(
+                                                                "{} Address: {} -> balance query failed (all providers unavailable)",
+                                                                network_str, address
+                                                            );
+                                                        }
                                                         0.0
                                                     }
                                                 };
